@@ -1,0 +1,109 @@
+services:
+  ollama:
+    image: ollama/ollama:0.17.7
+    container_name: ollama
+    restart: unless-stopped
+    runtime: nvidia
+    environment:
+      NVIDIA_VISIBLE_DEVICES: all
+      OLLAMA_HOST: 0.0.0.0:11434
+    volumes:
+      - ./ollama:/root/.ollama
+    expose:
+      - "11434"
+    networks:
+      - ai_internal
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 512
+    mem_limit: 10g
+
+  openwebui:
+    image: ghcr.io/open-webui/open-webui:v0.8.6
+    container_name: openwebui
+    restart: unless-stopped
+    depends_on:
+      - ollama
+    environment:
+      OLLAMA_BASE_URL: http://ollama:11434
+      WEBUI_AUTH: "True"
+      DEFAULT_USER_ROLE: user
+      ENABLE_SIGNUP: "False"
+    volumes:
+      - ./openwebui:/app/backend/data
+    ports:
+      - "127.0.0.1:3000:8080"
+    networks:
+      - ai_internal
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 512
+    tmpfs:
+      - /tmp:size=256m,mode=1777
+
+  qdrant:
+    image: qdrant/qdrant:v1.16.3
+    container_name: qdrant
+    restart: unless-stopped
+    expose:
+      - "6333"
+      - "6334"
+    volumes:
+      - ./qdrant:/qdrant/storage
+    networks:
+      - ai_internal
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 256
+
+  playwright:
+    image: mcr.microsoft.com/playwright:v1.55.0-jammy
+    container_name: playwright
+    restart: unless-stopped
+    command: ["sleep", "infinity"]
+    shm_size: "1gb"
+    networks:
+      - ai_internal
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 512
+    tmpfs:
+      - /tmp:size=512m,mode=1777
+
+  interpreter:
+    build: ./interpreter
+    image: ai-stack-interpreter:latest
+    container_name: open-interpreter
+    restart: unless-stopped
+    profiles:
+      - agent
+    working_dir: /workspace
+    command: ["tail", "-f", "/dev/null"]
+    volumes:
+      - ./workspace:/workspace
+    depends_on:
+      - ollama
+      - qdrant
+      - playwright
+    networks:
+      - ai_internal
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 512
+    tmpfs:
+      - /tmp:size=512m,mode=1777
+
+networks:
+  ai_internal:
+    driver: bridge
+    internal: true
