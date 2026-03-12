@@ -26,11 +26,17 @@ services:
     restart: unless-stopped
     depends_on:
       - ollama
+      - agent-runner
     environment:
       OLLAMA_BASE_URL: http://ollama:11434
       WEBUI_AUTH: "True"
       DEFAULT_USER_ROLE: user
       ENABLE_SIGNUP: "False"
+      # Pre-register the agent tool server as a Global Tool Server.
+      # Users must toggle it on per chat via the ➕ menu (hidden by default).
+      # The api_key is intentionally empty: agent-runner is only reachable
+      # within the internal Docker network and is not exposed to the host.
+      TOOL_SERVER_CONNECTIONS: '[{"url":"http://agent-runner:9000","api_key":""}]'
     volumes:
       - ./openwebui:/app/backend/data
     ports:
@@ -83,10 +89,11 @@ services:
     image: ai-stack-interpreter:latest
     container_name: open-interpreter
     restart: unless-stopped
-    profiles:
-      - agent
     working_dir: /workspace
-    command: ["tail", "-f", "/dev/null"]
+    environment:
+      OLLAMA_BASE_URL: http://ollama:11434
+      INTERPRETER_MODEL: ollama_chat/llama3
+      JOBS_DIR: /workspace/agent/jobs
     volumes:
       - ./workspace:/workspace
     depends_on:
@@ -95,6 +102,14 @@ services:
       - playwright
     networks:
       - ai_internal
+    expose:
+      - "8888"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8888/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
     security_opt:
       - no-new-privileges:true
     cap_drop:
@@ -102,6 +117,36 @@ services:
     pids_limit: 512
     tmpfs:
       - /tmp:size=512m,mode=1777
+
+  agent-runner:
+    build: ./agent-runner
+    image: ai-stack-agent-runner:latest
+    container_name: agent-runner
+    restart: unless-stopped
+    environment:
+      INTERPRETER_GATEWAY_URL: http://interpreter:8888
+    volumes:
+      - ./workspace:/workspace:ro
+    depends_on:
+      interpreter:
+        condition: service_healthy
+    networks:
+      - ai_internal
+    expose:
+      - "9000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 256
+    tmpfs:
+      - /tmp:size=256m,mode=1777
 
 networks:
   ai_internal:
