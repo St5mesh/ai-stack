@@ -44,20 +44,10 @@ else
     [[ "$REPLY" =~ ^[Yy]$ ]] || { info "Aborted."; exit 0; }
 fi
 
-# ─── 2. Agent profile ────────────────────────────────────────────────────────
-echo
-ask "Start the optional open-interpreter agent (profile: agent)? [y/N]"
-read -r START_AGENT
-COMPOSE_PROFILES=""
-if [[ "$START_AGENT" =~ ^[Yy]$ ]]; then
-    COMPOSE_PROFILES="--profile agent"
-    info "Agent profile enabled."
-fi
-
-# ─── 3. Persistent directories ─────────────────────────────────────────────────
+# ─── 2. Persistent directories ─────────────────────────────────────────────────
 echo
 info "Ensuring persistent directories exist for persistent storage..."
-DATA_DIRS=(ollama openwebui qdrant workspace)
+DATA_DIRS=(ollama openwebui qdrant workspace workspace/agent/jobs)
 for DIR in "${DATA_DIRS[@]}"; do
     if [[ -d "$DIR" ]]; then
         info "Using existing ./$DIR"
@@ -67,7 +57,7 @@ for DIR in "${DATA_DIRS[@]}"; do
     fi
 done
 
-# ─── 4. Pull latest images ─────────────────────────────────────────────────────
+# ─── 3. Pull latest images ─────────────────────────────────────────────────────
 echo
 ask "Pull the latest Docker images before launching? [Y/n]"
 read -r PULL_IMAGES
@@ -75,20 +65,19 @@ if [[ "$PULL_IMAGES" =~ ^[Nn]$ ]]; then
     info "Skipping docker compose pull."
 else
     info "Pulling latest images..."
-    if docker compose $COMPOSE_PROFILES pull; then
+    if docker compose pull; then
         success "Pulled latest Compose images."
     else
         warn "docker compose pull failed (see above); proceeding with existing images."
     fi
 fi
 
-# ─── 5. Start services ───────────────────────────────────────────────────────
+# ─── 4. Start services ───────────────────────────────────────────────────────
 echo
-info "Starting core services..."
-# shellcheck disable=SC2086
-docker compose $COMPOSE_PROFILES up -d
+info "Starting services (including interpreter sandbox and agent-runner)..."
+docker compose up -d
 
-# ─── 6. Wait for Ollama ──────────────────────────────────────────────────────
+# ─── 5. Wait for Ollama ──────────────────────────────────────────────────────
 echo
 info "Waiting for Ollama to become ready..."
 RETRIES=30
@@ -101,7 +90,28 @@ until docker exec ollama ollama list &>/dev/null 2>&1; do
 done
 success "Ollama is ready."
 
-# ─── 7. Verify runtimes and workflows ────────────────────────────────────────
+# ─── 5b. Wait for agent-runner ───────────────────────────────────────────────
+echo
+info "Waiting for agent-runner (OpenAPI tool server) to become ready..."
+RETRIES=40
+until docker exec agent-runner python -c \
+          "import urllib.request; urllib.request.urlopen('http://localhost:9000/health')" \
+          &>/dev/null 2>&1; do
+    RETRIES=$((RETRIES - 1))
+    if [[ $RETRIES -le 0 ]]; then
+        warn "agent-runner did not become ready in time; it may still be building."
+        warn "Check: docker compose logs agent-runner"
+        break
+    fi
+    sleep 3
+done
+if docker exec agent-runner python -c \
+       "import urllib.request; urllib.request.urlopen('http://localhost:9000/health')" \
+       &>/dev/null 2>&1; then
+    success "agent-runner is ready."
+fi
+
+# ─── 6. Verify runtimes and workflows ────────────────────────────────────────
 echo
 info "Verifying service status and runtimes..."
 docker compose ps
@@ -114,16 +124,15 @@ if docker compose ps | grep -q "^ *playwright"; then
         warn "Playwright container is running but version check failed."
     fi
 else
-    warn "Playwright service is not running; verify `docker compose up playwright`."
+    warn "Playwright service is not running; verify \`docker compose up playwright\`."
 fi
 
-if [[ "$COMPOSE_PROFILES" =~ agent ]]; then
-    info "Checking interpreter agent runtime..."
-    if INTERPRETER_VERSION=$(docker compose exec interpreter python --version 2>/dev/null); then
-        success "Interpreter container reports: $INTERPRETER_VERSION"
-    else
-        warn "Interpreter profile is enabled but python version check failed."
-    fi
+info "Checking interpreter gateway..."
+if docker compose exec interpreter python --version &>/dev/null 2>&1; then
+    INTERP_PY=$(docker compose exec interpreter python --version 2>/dev/null)
+    success "Interpreter container reports: $INTERP_PY"
+else
+    warn "Interpreter container not ready yet; check: docker compose logs interpreter"
 fi
 
 # ─── 7. Pull models ──────────────────────────────────────────────────────────
@@ -202,28 +211,46 @@ if curl -sf http://127.0.0.1:3000/health | grep -q '"status":"ok"' 2>/dev/null; 
 
     if [[ "$USER_COUNT" == "0" || -z "$USER_COUNT" ]]; then
         echo
-        ask "Create an initial admin account for Open WebUI? [Y/n]"
-        read -r CREATE_ADMIN
-        if [[ ! "$CREATE_ADMIN" =~ ^[Nn]$ ]]; then
-            ask "  Admin name:"
-            read -r ADMIN_NAME
-            ask "  Admin email:"
-            read -r ADMIN_EMAIL
-            ask "  Admin password:"
-            read -rs ADMIN_PASS
+        echo -e "${BOLD}┌──────────────────────────────────────────────────────┐${RESET}"
+        echo -e "${BOLD}│          Admin Account Setup — Hold Point            │${RESET}"
+        echo -e "${BOLD}└──────────────────────────────────────────────────────┘${RESET}"
+        echo
+        echo -e "  No admin account exists yet. Sign-up is currently ${RED}DISABLED${RESET} (secure default)."
+        echo
+        echo -e "  ${BOLD}Instructions:${RESET}"
+        echo -e "    1. Open ${CYAN}http://127.0.0.1:3000${RESET} in your browser."
+        echo -e "    2. Press ${BOLD}[any key]${RESET} below to ${GREEN}temporarily enable sign-up${RESET}."
+        echo -e "    3. Create your admin account in the browser."
+        echo -e "    4. Press ${BOLD}[x + Enter]${RESET} below to ${RED}re-disable sign-up${RESET} and secure the instance."
+        echo
+        ask "Press any key then Enter to temporarily enable sign-up  (or type 's' and Enter to skip):"
+        read -r SIGNUP_KEY
+        echo
+
+        if [[ "$SIGNUP_KEY" != "s" && "$SIGNUP_KEY" != "S" ]]; then
+            info "Enabling sign-up temporarily via Open WebUI config..."
+            docker exec openwebui sqlite3 /app/backend/data/webui.db \
+                "UPDATE config SET data = json_set(data, '$.ENABLE_SIGNUP', json('true'));" \
+                2>/dev/null || true
+
+            success "Sign-up is now ${GREEN}ENABLED${RESET}."
             echo
+            echo -e "  ${BOLD}→ Go to ${CYAN}http://127.0.0.1:3000${RESET} and create your admin account now.${RESET}"
+            echo
+            ask "When done, press [x + Enter] to re-disable sign-up:"
+            while true; do
+                read -r CLOSE_KEY
+                [[ "$CLOSE_KEY" == "x" || "$CLOSE_KEY" == "X" ]] && break
+                echo -e "  Please type ${BOLD}x${RESET} and press Enter to confirm."
+            done
 
-            RESULT=$(curl -sf -X POST http://127.0.0.1:3000/api/v1/auths/signup \
-                -H "Content-Type: application/json" \
-                -d "{\"name\":\"$ADMIN_NAME\",\"email\":\"$ADMIN_EMAIL\",\"password\":\"$ADMIN_PASS\"}" \
-                2>/dev/null || true)
-
-            if echo "$RESULT" | grep -q '"token"'; then
-                success "Admin account created for '$ADMIN_EMAIL'."
-            else
-                warn "Account creation may have failed. Try signing up at http://127.0.0.1:3000"
-                warn "Response: $RESULT"
-            fi
+            info "Re-disabling sign-up..."
+            docker exec openwebui sqlite3 /app/backend/data/webui.db \
+                "UPDATE config SET data = json_set(data, '$.ENABLE_SIGNUP', json('false'));" \
+                2>/dev/null || true
+            success "Sign-up is now ${RED}DISABLED${RESET}. Instance is secured."
+        else
+            info "Skipped admin setup. Enable sign-up manually if needed."
         fi
     else
         info "Open WebUI already has user accounts; skipping admin setup."
@@ -232,11 +259,19 @@ fi
 
 # ─── 9. Summary ──────────────────────────────────────────────────────────────
 echo
-echo -e "${BOLD}${GREEN}══════════════════════════════════${RESET}"
+echo -e "${BOLD}${GREEN}══════════════════════════════════════════════════${RESET}"
 echo -e "${BOLD}  Stack is up!${RESET}"
-echo -e "  Open WebUI   → ${CYAN}http://127.0.0.1:3000${RESET}"
-echo -e "  Ollama API   → internal (ollama:11434)"
-echo -e "  Qdrant REST  → internal (qdrant:6333)"
+echo -e "  Open WebUI      → ${CYAN}http://127.0.0.1:3000${RESET}"
+echo -e "  Ollama API      → internal (ollama:11434)"
+echo -e "  Qdrant REST     → internal (qdrant:6333)"
+echo -e "  Interpreter GW  → internal (open-interpreter:8888)"
+echo -e "  Agent Runner    → internal (agent-runner:9000)"
+echo
+echo -e "  ${BOLD}Agent tool server${RESET} is pre-registered in Open WebUI."
+echo -e "  To use it, click ${CYAN}➕${RESET} in the chat input area and toggle on"
+echo -e "  the Agent Runner tools (hidden by default per user)."
+echo
+echo -e "  Job logs & artifacts: ${CYAN}./workspace/agent/jobs/<job_id>/${RESET}"
 echo
 
 MODELS_NOW=$(docker exec ollama ollama list 2>/dev/null | tail -n +2 | awk '{print $1}' || true)
@@ -248,4 +283,4 @@ else
 fi
 
 echo -e "\n  To stop the stack: ${CYAN}docker compose down${RESET}"
-echo -e "${BOLD}${GREEN}══════════════════════════════════${RESET}\n"
+echo -e "${BOLD}${GREEN}══════════════════════════════════════════════════${RESET}\n"

@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Docker bind-mount data (do not commit)
+ollama/
+openwebui/
+qdrant/
+workspace/
+
+# Editor
+.vscode/
+.idea/
+*.swp
